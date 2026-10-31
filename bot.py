@@ -238,6 +238,26 @@ def handle_document(message: dict, update_id: int) -> None:
             send(owner, f"Клиент прислал лог: <code>{name}</code>")
         return
 
+    if name.lower().endswith(".txt"):
+        send(chat_id, "Смотрю замеры Wi-Fi, собираю отчёт…")
+        out_pdf = saved + "_report.pdf"
+        try:
+            import subprocess
+            import sys as _sys
+
+            subprocess.run(
+                [_sys.executable, os.path.join(BASE, "wifi_report.py"), saved, "--out", out_pdf],
+                capture_output=True, text=True, timeout=180, check=True,
+            )
+            send_document(chat_id, out_pdf, "Готовый отчёт по Wi-Fi. Нужен разбор — пишите.")
+            owner = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+            if owner and owner != chat_id:
+                send(owner, f"Клиент прислал замеры Wi-Fi: <code>{name}</code>")
+        except Exception as exc:  # noqa: BLE001
+            log(f"wifi_report fail: {exc}")
+            send(chat_id, "Не получилось разобрать файл. Нужен report.txt, который создаёт wifi_gather.py.")
+        return
+
     send(chat_id, DOC_UNKNOWN)
 
 
@@ -358,6 +378,10 @@ def main() -> int:
             })
         except Exception as exc:  # noqa: BLE001
             log(f"poll error: {exc}")
+            if args.once:
+                # в облаке ждать нечего: падаем сразу, чтобы запуск был красным,
+                # а не висел до таймаута
+                return 1
             time.sleep(3)
             continue
 
