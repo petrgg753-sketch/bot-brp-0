@@ -220,6 +220,109 @@ def leads_digest() -> str:
 
 # ---------------------------------------------------------------- handlers
 
+# ---------------------------------------------------------------- подписка
+
+SUBS = os.path.join(BASE, "subs.json")
+
+SUB_PLANS = (
+    "<b>Проверка Wi-Fi по подписке</b>\n\n"
+    "Раз в месяц вы присылаете файл замеров — получаете отчёт: какие каналы забиты, "
+    "кто мешает, что изменилось с прошлого раза.\n\n"
+    "<b>2 900 ₽ в месяц.</b>\n\n"
+    "Первый месяц — вводный: разовый аудит за 3 900 ₽ и месяц наблюдения в подарок.\n\n"
+    "Оформление — кнопка ниже. Оплата после подтверждения, реквизиты пришлю в чат."
+)
+
+SUB_KEYBOARD = {
+    "inline_keyboard": [[{"text": "Оформить подписку", "callback_data": "sub:new"}]],
+}
+
+
+def load_subs() -> dict:
+    try:
+        with open(SUBS, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_subs(data: dict) -> None:
+    with open(SUBS, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+
+
+def owner_id() -> int:
+    return int(os.environ.get("TELEGRAM_CHAT_ID", "0") or 0)
+
+
+def add_months(chat_id: int, months: int) -> str:
+    from datetime import date, timedelta
+
+    subs = load_subs()
+    key = str(chat_id)
+    entry = subs.get(key, {})
+    today = date.today()
+    start = today
+    if entry.get("until"):
+        try:
+            parsed = date.fromisoformat(entry["until"])
+            if parsed > today:
+                start = parsed
+        except Exception:  # noqa: BLE001
+            pass
+    until = start + timedelta(days=30 * months)
+    entry["until"] = until.isoformat()
+    entry.setdefault("since", today.isoformat())
+    subs[key] = entry
+    save_subs(subs)
+    return until.isoformat()
+
+
+def sub_line(chat_id: int) -> str:
+    from datetime import date
+
+    entry = load_subs().get(str(chat_id), {})
+    if not entry.get("until"):
+        return "подписки нет"
+    try:
+        days = (date.fromisoformat(entry["until"]) - date.today()).days
+    except Exception:  # noqa: BLE001
+        return "подписка активна"
+    if days < 0:
+        return f"истекла {entry['until']}"
+    return f"активна до {entry['until']} ({days} дн.)"
+
+
+def check_due() -> None:
+    """Напоминает о скором окончании подписки, не чаще раза в день."""
+    from datetime import date
+
+    subs = load_subs()
+    today = date.today().isoformat()
+    changed = False
+
+    for key, entry in subs.items():
+        until = entry.get("until")
+        if not until or entry.get("reminded") == today:
+            continue
+        try:
+            days = (date.fromisoformat(until) - date.today()).days
+        except Exception:  # noqa: BLE001
+            continue
+        if 0 <= days <= 3:
+            try:
+                send(int(key), f"Подписка заканчивается {until}. Продлить — /subscribe")
+                if owner_id():
+                    send(owner_id(), f"Подписка клиента {key} до {until} ({days} дн.)")
+            except Exception:  # noqa: BLE001
+                pass
+            entry["reminded"] = today
+            changed = True
+
+    if changed:
+        save_subs(subs)
+
+
 def handle_document(message: dict, update_id: int) -> None:
     chat_id = message["chat"]["id"]
     document = message["document"]
@@ -249,7 +352,7 @@ def handle_document(message: dict, update_id: int) -> None:
                 [_sys.executable, os.path.join(BASE, "wifi_report.py"), saved, "--out", out_pdf],
                 capture_output=True, text=True, timeout=180, check=True,
             )
-            send_document(chat_id, out_pdf, "Готовый отчёт по Wi-Fi. Нужен разбор — пишите.")
+            send_document(chat_id, out_pdf, f"Готовый отчёт по Wi-Fi. Ваша подписка: {sub_line(chat_id)}")
             owner = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
             if owner and owner != chat_id:
                 send(owner, f"Клиент прислал замеры Wi-Fi: <code>{name}</code>")
@@ -305,6 +408,34 @@ def handle_message(message: dict, update_id: int) -> None:
                 send(chat_id, leads_digest())
             else:
                 send(chat_id, "Команда только для владельца.")
+        elif command == "/subscribe":
+            send(chat_id, SUB_PLANS, SUB_KEYBOARD)
+        elif command == "/mysub":
+            send(chat_id, f"Ваша подписка: {sub_line(chat_id)}")
+        elif command == "/subs":
+            if chat_id != owner_id():
+                send(chat_id, "Команда только для владельца.")
+            else:
+                subs = load_subs()
+                lines = [f"<code>{key}</code> — {value.get('until', 'заявка')}"
+                         for key, value in subs.items()]
+                send(chat_id, "\n".join(lines) if lines else "Подписок пока нет.")
+        elif command == "/paid":
+            if chat_id != owner_id():
+                send(chat_id, "Команда только для владельца.")
+            elif len(text.split()) < 2:
+                send(chat_id, "Формат: /paid &lt;chat_id&gt; [месяцев]")
+            else:
+                parts = text.split()
+                try:
+                    target = int(parts[1])
+                    months = int(parts[2]) if len(parts) > 2 else 1
+                except ValueError:
+                    send(chat_id, "chat_id и число месяцев должны быть числами.")
+                    return
+                until = add_months(target, months)
+                send(chat_id, f"Оплачено до {until}")
+                send(target, f"Подписка активна до {until}. В конце месяца пришлите report.txt — верну отчёт.")
         else:
             send(chat_id, "Не знаю такую команду. /start")
         return
@@ -347,6 +478,21 @@ def handle_callback(callback: dict) -> None:
     elif data == "report":
         if os.path.exists(PDF_SAMPLE):
             send_document(chat_id, PDF_SAMPLE, "Пример отчёта")
+    elif data == "sub:new":
+        from datetime import date
+
+        subs = load_subs()
+        key = str(chat_id)
+        entry = subs.get(key, {})
+        entry["requested"] = date.today().isoformat()
+        subs[key] = entry
+        save_subs(subs)
+
+        send(chat_id, "Заявка принята. Подтвержу и пришлю реквизиты в этот чат.")
+        if owner_id() and owner_id() != chat_id:
+            username = message.get("chat", {}).get("username")
+            who = f"@{username}" if username else str(chat_id)
+            send(owner_id(), f"Заявка на подписку: {who} (<code>{chat_id}</code>)")
     else:
         send(chat_id, "Не понял кнопку. /start")
 
@@ -369,6 +515,7 @@ def main() -> int:
                     pass
 
     log(f"bot started, offset={offset}")
+    last_due_check = 0.0
     while True:
         try:
             data = api("getUpdates", {
@@ -378,9 +525,11 @@ def main() -> int:
             })
         except Exception as exc:  # noqa: BLE001
             log(f"poll error: {exc}")
+            if "Conflict" in str(exc) or "409" in str(exc):
+                # второй поллер уже слушает — это норма, выходим тихо
+                log("другой экземпляр бота активен, пропускаю запуск")
+                return 0
             if args.once:
-                # в облаке ждать нечего: падаем сразу, чтобы запуск был красным,
-                # а не висел до таймаута
                 return 1
             time.sleep(3)
             continue
@@ -399,6 +548,13 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 log(f"handle error {update['update_id']}: {exc}")
                 continue
+
+        if time.time() - last_due_check > 600:
+            last_due_check = time.time()
+            try:
+                check_due()
+            except Exception as exc:  # noqa: BLE001
+                log(f"check_due error: {exc}")
 
         if args.once:
             # подтверждаем смещение, чтобы Telegram не отдал эти же сообщения снова
